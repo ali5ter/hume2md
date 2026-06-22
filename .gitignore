@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Local sample exports (don't commit personal health data)
+*.png
+*.md
+!README.md
