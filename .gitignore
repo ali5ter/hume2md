@@ -14,3 +14,5 @@ venv/
 *.png
 *.md
 !README.md
+CLAUDE.md
+CLAUDE.md.backup.*
