@@ -49,23 +49,54 @@ Writes `HumeProgressReport22_Jun_2026.md` next to the image. Options:
 python3 hume2md.py REPORT.png -o out.md      # choose output path
 python3 hume2md.py REPORT.png --raw          # raw OCR text only (skip parsing)
 python3 hume2md.py REPORT.png --date 2026-06-22
+python3 hume2md.py REPORT.png --csv metrics.csv  # append-ready CSV rows
 ```
 
 ## Output
 
 A Markdown table of recognized metrics (Weight, Body Fat %, Skeletal Muscle
 Mass, Body Water %, BMR, Metabolic Age, …) followed by a `Raw OCR text`
-section.
+section. With `--csv`, each verified metric is also written as a
+`date,metric,value,unit` row.
+
+Each metric is bound to its own card: the label is located, then its
+previous/current values are read from the numeric tokens nearest that label's
+own position — not from list position — so a neighboring card's numbers
+cannot bleed in. Parsed values are then checked against per-metric
+plausibility ranges and cross-metric invariants (e.g. body cell mass < lean
+mass < weight). A metric that fails a check is rendered as `⚠️ unverified`
+in the Markdown, a warning is printed to stderr, and the process exits
+non-zero — a suspect value is never silently reported as good data, and is
+excluded from `--csv` output.
 
 ## Limitations
 
-- The previous/current column order is inferred from horizontal position
-  (left = previous, right = current). **Verify against the source image** —
-  Hume's layout can shift between report types.
 - Parsing is best-effort; the raw OCR section is always included so the export
   is useful even when a field is missed. Use `--raw` if parsing misbehaves.
+- Plausibility ranges and invariants catch out-of-range or physically
+  impossible values, not every misread — a wrong-but-plausible number can
+  still slip through. **Verify against the source image.**
 - BIA body-water and muscle figures are noisy between scans. Treat single
   readings with caution and watch multi-week trends (Hume's own guidance).
+
+## Exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | Success |
+| 1 | Input/usage error |
+| 2 | OCR/runtime error |
+| 3 | One or more metrics failed validation (Markdown/CSV are still written) |
+
+## Testing
+
+```bash
+pip install pytest
+pytest
+```
+
+Regression tests run against committed OCR-token JSON fixtures under
+`tests/fixtures/`, so they don't require macOS or Apple Vision.
 
 ## License
 
