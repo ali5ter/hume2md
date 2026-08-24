@@ -12,8 +12,8 @@ rather than silently reported as good data. The raw OCR text is always
 appended so the output is useful even when parsing misses a field.
 
 Author: Alister Lewis-Bowen <alister@lewis-bowen.org>
-Version: 0.2.0
-Date: 2026-08-23
+Version: 0.2.1
+Date: 2026-08-24
 License: MIT
 Usage:
     ./hume2md.py REPORT.png [-o OUTPUT.md] [--raw] [--date YYYY-MM-DD]
@@ -67,7 +67,11 @@ METRIC_SPECS: list[tuple[str, re.Pattern[str], str | None]] = [
     ("Fat Free Mass", re.compile(r"\bfat[- ]free mass\b"), "lb"),
     ("Lean Mass", re.compile(r"\blean (?:mass|body mass)\b"), "lb"),
     ("Skeletal Muscle Mass", re.compile(r"\bskeletal muscle mass\b"), "lb"),
-    ("Bone Mass", re.compile(r"\bbone mass\b"), "lb"),
+    # Hume's card is labeled "Skeletal Mass" on screen, not "Bone Mass" — the
+    # canonical name is kept for output clarity, but the pattern must match
+    # what actually renders or this card is never claimed and its value
+    # bleeds into Skeletal Muscle Mass's card-window search instead.
+    ("Bone Mass", re.compile(r"\b(?:bone mass|skeletal mass)\b"), "lb"),
     ("Visceral Fat Index", re.compile(r"\bvisceral fat(?: index)?\b"), None),
     ("Body Water %", re.compile(r"\bbody water\s*%"), "%"),
     ("Protein", re.compile(r"\bprotein\b"), "lb"),
@@ -86,6 +90,7 @@ METRIC_RANGES: dict[str, tuple[float, float]] = {
     "Visceral Fat Index": (1, 30),
     "Metabolic Age": (18, 100),
     "BMR": (800, 3000),
+    "Skeletal Muscle Mass": (40, 150),
 }
 
 NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
@@ -117,6 +122,7 @@ class Report:
 
     metrics: list[Metric] = field(default_factory=list)
     raw_lines: list[str] = field(default_factory=list)
+    unparsed: list[str] = field(default_factory=list)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -279,19 +285,31 @@ def _bind_metric(
     rows: list[list[Token]],
     pattern: re.Pattern[str],
     used: set[tuple[int, int]],
+    all_patterns: list[re.Pattern[str]],
 ) -> tuple[str | None, str] | None:
     """Locate a metric's label and bind its previous/current values.
 
     Finds the first row whose text matches ``pattern`` at tokens not already
-    claimed by another metric, then looks for numeric values on that same row
-    and up to ``CARD_FORWARD_WINDOW`` rows below it — mirroring the Hume card
-    layout, where values render directly beneath their label. Only unclaimed
-    numeric tokens within ``CARD_MAX_X_SPAN`` of the label's own tokens are
-    considered, so a neighbouring card sharing the row (the horizontal
-    summary strip) or a nearby row is not absorbed into this metric. If no
-    row in the window carries a usable numeric value, the metric is
-    abandoned — the search does not continue past the window to some
-    unrelated row later in the document.
+    claimed by another metric, then gathers numeric values from that row and
+    up to ``CARD_FORWARD_WINDOW`` rows below it — mirroring the Hume card
+    layout, where values render either beside the label or directly beneath
+    it. The label's own row is checked first and on both sides of the label
+    (some cards render "previous  LABEL  current" on one line, others render
+    the label alone with values below), so a same-row card never falls
+    through to a row that belongs to the next card. Only unclaimed numeric
+    tokens within ``CARD_MAX_X_SPAN`` of the label's own tokens are
+    considered, keeping a neighbouring card sharing the row (the horizontal
+    summary strip) from being absorbed into this metric.
+
+    A single row does not always carry both values — OCR row-clustering can
+    split "previous" and "current" across two rows a fraction of a pixel
+    apart in y. So candidates accumulate across the window until two are
+    found, rather than stopping at the first row that has any; accumulation
+    stops early if a forward row's text matches another metric's label,
+    since that means the card window has run into the next card. If no
+    numeric value turns up anywhere in the window, the metric is abandoned —
+    the search does not continue past the window to some unrelated row later
+    in the document.
 
     Tracking is per-token rather than per-row so two metrics whose labels sit
     side by side on one shared row (e.g. "Weight ... Metabolic Age ...") each
@@ -302,6 +320,8 @@ def _bind_metric(
         pattern: The metric's compiled label pattern.
         used: (row_index, token_index) pairs already bound to another
             metric; mutated in place with the tokens this call claims.
+        all_patterns: Every metric's compiled label pattern, used to detect
+            when a forward row has crossed into the next card.
 
     Returns:
         ``(previous, current)``, or ``None`` if the label was not found or no
@@ -319,32 +339,40 @@ def _bind_metric(
         if any((label_idx, i) in used for i in range(start_idx, end_idx + 1)):
             continue  # This occurrence's tokens are already another metric's.
 
-        label_x = label_row[start_idx].x
+        min_x = label_row[start_idx].x - CARD_MAX_X_SPAN
         max_x = label_row[end_idx].x + CARD_MAX_X_SPAN
 
+        candidates: list[tuple[int, int, Token]] = []
         for offset in range(CARD_FORWARD_WINDOW + 1):
             value_idx = label_idx + offset
             if value_idx >= len(rows):
                 continue
-            candidates = _numbers_in_span(
-                rows[value_idx], value_idx, label_x, max_x, used
-            )
-            if not candidates:
-                continue
-            candidates.sort(key=lambda pair: pair[1].x)
-            previous = (
-                NUMBER_RE.search(candidates[0][1].text).group()
-                if len(candidates) >= 2
-                else None
-            )
-            current = NUMBER_RE.search(candidates[-1][1].text).group()
+            row = rows[value_idx]
+            if offset > 0:
+                text = " ".join(t.text for t in row).lower()
+                if any(p is not pattern and p.search(text) for p in all_patterns):
+                    break  # Ran into the next card; stop accumulating.
+            found = _numbers_in_span(row, value_idx, min_x, max_x, used)
+            candidates.extend((value_idx, i, t) for i, t in found)
+            if len(candidates) >= 2:
+                break
 
-            for i in range(start_idx, end_idx + 1):
-                used.add((label_idx, i))
-            used.add((value_idx, candidates[0][0]))
-            used.add((value_idx, candidates[-1][0]))
-            return previous, current
-        return None  # Label found but no numeric row in window: abandon it.
+        if not candidates:
+            return None  # Label found but no numeric value in window: abandon it.
+
+        candidates.sort(key=lambda c: (c[0], c[2].x))
+        previous = (
+            NUMBER_RE.search(candidates[0][2].text).group()
+            if len(candidates) >= 2
+            else None
+        )
+        current = NUMBER_RE.search(candidates[-1][2].text).group()
+
+        for i in range(start_idx, end_idx + 1):
+            used.add((label_idx, i))
+        used.add((candidates[0][0], candidates[0][1]))
+        used.add((candidates[-1][0], candidates[-1][1]))
+        return previous, current
     return None
 
 
@@ -360,8 +388,9 @@ def parse_metrics(rows: list[list[Token]]) -> list[Metric]:
     """
     metrics: list[Metric] = []
     used: set[tuple[int, int]] = set()
+    all_patterns = [pattern for _, pattern, _ in METRIC_SPECS]
     for label, pattern, unit in METRIC_SPECS:
-        bound = _bind_metric(rows, pattern, used)
+        bound = _bind_metric(rows, pattern, used, all_patterns)
         if bound is None:
             continue
         previous, current = bound
@@ -435,6 +464,15 @@ def validate_metrics(metrics: list[Metric]) -> list[str]:
             f"({body_fat_mass})",
         )
 
+    skeletal_muscle, bone = value("Skeletal Muscle Mass"), value("Bone Mass")
+    if skeletal_muscle is not None and bone is not None and not skeletal_muscle > bone:
+        flag_pair(
+            "Skeletal Muscle Mass",
+            "Bone Mass",
+            f"Skeletal Muscle Mass ({skeletal_muscle}) should be greater than "
+            f"Bone Mass ({bone})",
+        )
+
     return warnings
 
 
@@ -492,6 +530,17 @@ def render_markdown(report: Report, source: str, date: str, raw_only: bool) -> s
             "",
         ]
 
+    if not raw_only and report.unparsed:
+        lines += ["## Metrics not parsed", ""]
+        lines += [f"- {label}" for label in report.unparsed]
+        lines += [
+            "",
+            "> Expected but not bound to a value in this report — see the raw "
+            "OCR text below to check whether the source image renders them "
+            "differently than usual.",
+            "",
+        ]
+
     lines += ["## Raw OCR text", "", "```text"]
     lines += report.raw_lines
     lines += ["```", ""]
@@ -544,9 +593,12 @@ def main(argv: list[str] | None = None) -> int:
     rows = cluster_rows(tokens)
     metrics = [] if args.raw else parse_metrics(rows)
     warnings = [] if args.raw else validate_metrics(metrics)
+    parsed_labels = {m.label for m in metrics}
+    unparsed = [label for label, _, _ in METRIC_SPECS if label not in parsed_labels]
     report = Report(
         metrics=metrics,
         raw_lines=[" ".join(t.text for t in row) for row in rows],
+        unparsed=[] if args.raw else unparsed,
     )
 
     date = infer_date(args.image, args.date)

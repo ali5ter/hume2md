@@ -3,7 +3,10 @@
 Fixtures are OCR-token JSON files (see tests/fixtures/), not PNGs, so the
 suite runs without macOS or Apple Vision. Each covers a failure mode from the
 parser rewrite: cross-card contamination, an abandoned metric that must not
-fall back to an unrelated row, and implausible values caught by validation.
+fall back to an unrelated row, implausible values caught by validation, and
+(regenerated_report) the layouts from issue #3 — a label flanked by
+previous/current on one row, and previous/current split across two rows by
+OCR y-jitter.
 
 Author: Alister Lewis-Bowen <alister@lewis-bowen.org>
 """
@@ -15,6 +18,7 @@ from pathlib import Path
 from conftest import load_tokens
 
 from hume2md import (
+    METRIC_SPECS,
     Metric,
     cluster_rows,
     parse_metrics,
@@ -121,6 +125,51 @@ def test_render_markdown_shows_unverified_warning_for_flagged_metric():
     assert "⚠️ unverified" in markdown
     assert "| Weight | " in markdown
     assert "176.0" in markdown
+
+
+def test_same_row_card_binds_own_values_not_the_next_cards():
+    """Regression for issue #3: a label flanked by prev/current on one row
+    must not fall through to the card below it (Skeletal Muscle Mass reading
+    Bone Mass's value)."""
+    metrics = {m.label: m for m in _parse("regenerated_report")}
+
+    assert metrics["Skeletal Muscle Mass"].previous == "98.7"
+    assert metrics["Skeletal Muscle Mass"].current == "98.8"
+    assert metrics["Bone Mass"].previous == "23.0"
+    assert metrics["Bone Mass"].current == "23.1"
+
+
+def test_previous_and_current_split_across_rows_both_bind():
+    """Regression for issue #3: OCR row-clustering can split "previous" and
+    "current" a fraction of a pixel apart in y, landing them in separate
+    rows. Both values must still be found, in order, not just the first."""
+    metrics = {m.label: m for m in _parse("regenerated_report")}
+
+    assert metrics["Weight"].previous == "175.9"
+    assert metrics["Weight"].current == "176.7"
+    assert metrics["Lean Mass"].previous == "143.6"
+    assert metrics["Lean Mass"].current == "143.7"
+
+
+def test_regenerated_report_passes_validation():
+    metrics = _parse("regenerated_report")
+
+    assert validate_metrics(metrics) == []
+    assert all(not m.unverified for m in metrics)
+
+
+def test_unparsed_metrics_are_listed_not_silently_dropped():
+    rows = cluster_rows(load_tokens("regenerated_report"))
+    metrics = parse_metrics(rows)
+    parsed = {m.label for m in metrics}
+    unparsed = [label for label, _, _ in METRIC_SPECS if label not in parsed]
+    report = ReportType(metrics=metrics, raw_lines=["dummy"], unparsed=unparsed)
+
+    markdown = render_markdown(report, "report.png", "2026-08-23", raw_only=False)
+
+    assert "## Metrics not parsed" in markdown
+    assert "- Body Fat Mass" in markdown
+    assert "Skeletal Muscle Mass" not in markdown.split("## Metrics not parsed")[1]
 
 
 def test_write_csv_omits_unverified_rows(tmp_path: Path):
