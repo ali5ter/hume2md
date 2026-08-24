@@ -12,7 +12,7 @@ rather than silently reported as good data. The raw OCR text is always
 appended so the output is useful even when parsing misses a field.
 
 Author: Alister Lewis-Bowen <alister@lewis-bowen.org>
-Version: 0.2.1
+Version: 0.2.2
 Date: 2026-08-24
 License: MIT
 Usage:
@@ -398,6 +398,40 @@ def parse_metrics(rows: list[list[Token]]) -> list[Metric]:
     return metrics
 
 
+def _repair_unitless_value(raw: str, bounds: tuple[float, float]) -> str | None:
+    """Recover a trend-arrow-corrupted value for a unit-less metric.
+
+    Every Hume card carries a trend arrow (⇆ ↑ ↓) after its current value.
+    For metrics with a unit, the unit string delimits the value from that
+    arrow so Vision keeps them as separate tokens. Unit-less metrics (e.g.
+    Visceral Fat Index) have no such delimiter, so Vision sometimes merges
+    the arrow glyph straight onto the value's last digit (``7`` + misread
+    arrow becomes the single token ``75``). Stripping that trailing
+    character recovers the original value when doing so lands back inside
+    the metric's plausible range.
+
+    This is an interim, single-character fix — see issue #5's proposed
+    x-geometry filter (discarding tokens whose x-position falls in the
+    arrow column) for the general fix, which should replace this once
+    landed.
+
+    Args:
+        raw: The corrupted numeric string as extracted from OCR.
+        bounds: The metric's plausibility range.
+
+    Returns:
+        The repaired numeric string, or ``None`` if stripping the last
+        character does not produce a plausible number.
+    """
+    stripped = raw[:-1]
+    if not NUMBER_RE.fullmatch(stripped):
+        return None
+    low, high = bounds
+    if not (low <= float(stripped) <= high):
+        return None
+    return stripped
+
+
 def validate_metrics(metrics: list[Metric]) -> list[str]:
     """Flag implausible metrics in place and return human-readable warnings.
 
@@ -405,7 +439,10 @@ def validate_metrics(metrics: list[Metric]) -> list[str]:
     cross-metric invariants that catch card-crossover errors a range check
     alone would miss (e.g. a metabolic age bound to a weight reading). Any
     metric that fails a check has ``Metric.unverified`` set so the renderer
-    can flag it instead of reporting a wrong number as good data.
+    can flag it instead of reporting a wrong number as good data. Unit-less
+    metrics get one more chance first: :func:`_repair_unitless_value` tries
+    to recover a value corrupted by a merged trend-arrow glyph before giving
+    up and flagging it.
 
     Args:
         metrics: Parsed metrics, mutated in place.
@@ -429,6 +466,11 @@ def validate_metrics(metrics: list[Metric]) -> list[str]:
         low, high = bounds
         current = float(m.current)
         if not (low <= current <= high):
+            if m.unit is None:
+                repaired = _repair_unitless_value(m.current, bounds)
+                if repaired is not None:
+                    m.current = repaired
+                    continue
             m.unverified = True
             warnings.append(
                 f"{m.label} = {m.current} is outside the plausible range "
