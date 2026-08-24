@@ -172,6 +172,19 @@ def test_unparsed_metrics_are_listed_not_silently_dropped():
     assert "Skeletal Muscle Mass" not in markdown.split("## Metrics not parsed")[1]
 
 
+def test_vfi_recovers_from_merged_trend_arrow_glyph():
+    """Regression for issue #5: Visceral Fat Index has no unit to delimit its
+    value from the trailing trend-arrow glyph, so Vision merges them into one
+    token ("7" + misread arrow -> "75"). Validation should strip the merged
+    digit and recover the plausible value rather than flag it unverified."""
+    metrics = {m.label: m for m in _parse("vfi_arrow_glyph_merge")}
+    warnings = validate_metrics(list(metrics.values()))
+
+    assert metrics["Visceral Fat Index"].current == "7"
+    assert metrics["Visceral Fat Index"].unverified is False
+    assert warnings == []
+
+
 def test_write_csv_omits_unverified_rows(tmp_path: Path):
     metrics = _parse("validation_failures")
     validate_metrics(metrics)
