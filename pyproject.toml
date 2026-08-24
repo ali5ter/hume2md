@@ -1,6 +1,6 @@
 [project]
 name = "hume2md"
-version = "0.2.0"
+version = "0.2.1"
 description = "Convert a Hume Body Pod progress-report PNG into labeled Markdown."
 authors = [{ name = "Alister Lewis-Bowen", email = "alister@lewis-bowen.org" }]
 readme = "README.md"
