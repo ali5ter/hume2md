@@ -60,14 +60,22 @@ section. With `--csv`, each verified metric is also written as a
 `date,metric,value,unit` row.
 
 Each metric is bound to its own card: the label is located, then its
-previous/current values are read from the numeric tokens nearest that label's
-own position — not from list position — so a neighboring card's numbers
-cannot bleed in. Parsed values are then checked against per-metric
-plausibility ranges and cross-metric invariants (e.g. body cell mass < lean
-mass < weight). A metric that fails a check is rendered as `⚠️ unverified`
-in the Markdown, a warning is printed to stderr, and the process exits
-non-zero — a suspect value is never silently reported as good data, and is
-excluded from `--csv` output.
+previous/current values are read from the numeric tokens nearest that
+label — not a neighboring label sharing the same row — with the trend-arrow
+marker (`>` or `›`) Hume renders before the current value used to tell the
+two apart, since a card's previous value can render before or after its
+label depending on layout. A label matching more than one place in the
+report (Hume's horizontal summary strip re-states a couple of metrics above
+the detailed cards) prefers the detailed card over the strip. Labels garbled
+by OCR beyond exact matching (e.g. `Boov -at Masd` for `Body Fat Mass`) fall
+back to approximate text matching, with the raw OCR text they matched to
+echoed under a `Fuzzy-matched labels` section so a bad match stays visible.
+
+Parsed values are then checked against per-metric plausibility ranges and
+cross-metric invariants (e.g. body cell mass < lean mass < weight). A metric
+that fails a check is rendered as `⚠️ unverified` in the Markdown, a warning
+is printed to stderr, and the process exits non-zero — a suspect value is
+never silently reported as good data, and is excluded from `--csv` output.
 
 ## Limitations
 

@@ -6,7 +6,10 @@ parser rewrite: cross-card contamination, an abandoned metric that must not
 fall back to an unrelated row, implausible values caught by validation, and
 (regenerated_report) the layouts from issue #3 — a label flanked by
 previous/current on one row, and previous/current split across two rows by
-OCR y-jitter.
+OCR y-jitter. aug_30_2026_report covers issue #7 — a real report whose
+horizontal summary strip pre-empted the detailed cards below it, whose
+current-value token routinely fell outside the old fixed x-span, and whose
+labels were garbled by OCR beyond exact matching.
 
 Author: Alister Lewis-Bowen <alister@lewis-bowen.org>
 """
@@ -198,3 +201,76 @@ def test_write_csv_omits_unverified_rows(tmp_path: Path):
     assert "Metabolic Age" not in content
     assert "Body Cell Mass" not in content
     assert "Lean Mass" not in content
+
+
+# Ground truth read off the source PNG by eye — see issue #7.
+# (label, previous, current, unit)
+AUG_30_2026_GROUND_TRUTH = [
+    ("Health Score", None, "693", None),
+    ("Weight", "176.7", "175.7", "lb"),
+    ("Body Fat %", "12.0", "11.7", "%"),
+    ("Body Fat Mass", "21.2", "20.6", "lb"),
+    ("Lean Mass", "143.7", "144.2", "lb"),
+    ("Subcutaneous Fat Mass", "18.4", "17.9", "lb"),
+    ("Skeletal Muscle Mass", "98.8", "99.2", "lb"),
+    ("Bone Mass", "23.1", "23.1", "lb"),
+    ("Body Water %", "64.7", "65.1", "%"),
+    ("BMR", "1747", "1745", "cal"),
+    ("Metabolic Age", "45", "45", "years"),
+    ("Resting Heart Rate", "73", "73", "bpm"),
+    ("Body Cell Mass", "101.6", "103.6", "lb"),
+]
+
+
+def test_aug_30_2026_report_matches_ground_truth_cell_for_cell():
+    """Regression for issue #7: a summary strip pre-empting the detailed
+    cards below it, a current-value token routinely falling outside the old
+    fixed x-span, and labels garbled beyond exact regex matching."""
+    metrics = {m.label: m for m in _parse("aug_30_2026_report")}
+
+    for label, previous, current, unit in AUG_30_2026_GROUND_TRUTH:
+        metric = metrics[label]
+        assert (metric.previous, metric.current, metric.unit) == (
+            previous,
+            current,
+            unit,
+        ), label
+
+
+def test_aug_30_2026_report_visceral_fat_index_previous_is_a_known_ocr_gap():
+    """Vision never recognizes a previous-value token for this card in this
+    report (confirmed against the raw fixture tokens) — a genuine OCR
+    limitation, not a binding defect, so only current is asserted here."""
+    metrics = {m.label: m for m in _parse("aug_30_2026_report")}
+
+    assert metrics["Visceral Fat Index"].current == "6"
+
+
+def test_aug_30_2026_report_passes_validation():
+    metrics = _parse("aug_30_2026_report")
+
+    assert validate_metrics(metrics) == []
+    assert all(not m.unverified for m in metrics)
+
+
+def test_aug_30_2026_report_fuzzy_matches_are_echoed():
+    """Regression for issue #7: labels garbled beyond exact matching (e.g.
+    "Boov -at Masd" for Body Fat Mass) must still bind, with the raw OCR
+    text they matched echoed so a bad match stays visible in the output."""
+    metrics = {m.label: m for m in _parse("aug_30_2026_report")}
+
+    assert metrics["Body Fat Mass"].source_label == "Boov -at Masd"
+    assert metrics["BMR"].source_label == "IRMP (Raca Mataholic Rata)"
+    assert metrics["Body Cell Mass"].source_label == "Rodvca Macd"
+    assert metrics["Weight"].source_label is None
+
+
+def test_aug_30_2026_report_leaves_genuinely_absent_metrics_unparsed():
+    """Fat Free Mass and Protein are not rendered in this report at all —
+    they must stay unparsed, not get fuzzy-matched to an unrelated label."""
+    rows = cluster_rows(load_tokens("aug_30_2026_report"))
+    metrics = parse_metrics(rows)
+    parsed = {m.label for m in metrics}
+
+    assert "Fat Free Mass" not in parsed
+    assert "Protein" not in parsed
