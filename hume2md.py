@@ -12,8 +12,8 @@ rather than silently reported as good data. The raw OCR text is always
 appended so the output is useful even when parsing misses a field.
 
 Author: Alister Lewis-Bowen <alister@lewis-bowen.org>
-Version: 0.2.2
-Date: 2026-08-24
+Version: 0.3.0
+Date: 2026-08-31
 License: MIT
 Usage:
     ./hume2md.py REPORT.png [-o OUTPUT.md] [--raw] [--date YYYY-MM-DD]
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import re
 import sys
 from dataclasses import dataclass, field
@@ -51,19 +52,18 @@ ROW_Y_TOLERANCE = 0.015
 # plus slack — but stops well short of the next unrelated card.
 CARD_FORWARD_WINDOW = 3
 
-# Max normalized x-distance from a label's own tokens that a numeric token may
-# be bound to it. Keeps a neighbouring card sharing a row (the summary strip)
-# or a nearby row from being absorbed into this metric.
-CARD_MAX_X_SPAN = 0.4
-
 # Word-boundary, mutually exclusive per metric. Order does not disambiguate
 # overlap anymore (each pattern is anchored so it cannot match another
 # metric's label) — it only affects the order metrics appear in the output.
+# Patterns accept the phrasing variants Hume has actually rendered across
+# reports (e.g. "Body Fat Percentage" spelled out instead of "Body Fat %"),
+# since exact substring matching cannot survive OCR-garbled labels at all —
+# those fall through to the fuzzy-matching pass in _fuzzy_bind_metrics().
 METRIC_SPECS: list[tuple[str, re.Pattern[str], str | None]] = [
     ("Health Score", re.compile(r"\bhealth score\b"), None),
     ("Body Fat Mass", re.compile(r"\bbody fat mass\b"), "lb"),
     ("Subcutaneous Fat Mass", re.compile(r"\bsubcutaneous fat mass\b"), "lb"),
-    ("Body Fat %", re.compile(r"\bbody fat\s*%"), "%"),
+    ("Body Fat %", re.compile(r"\bbody fat\s*%|\bbody fat percentage\b"), "%"),
     ("Fat Free Mass", re.compile(r"\bfat[- ]free mass\b"), "lb"),
     ("Lean Mass", re.compile(r"\blean (?:mass|body mass)\b"), "lb"),
     ("Skeletal Muscle Mass", re.compile(r"\bskeletal muscle mass\b"), "lb"),
@@ -73,11 +73,11 @@ METRIC_SPECS: list[tuple[str, re.Pattern[str], str | None]] = [
     # bleeds into Skeletal Muscle Mass's card-window search instead.
     ("Bone Mass", re.compile(r"\b(?:bone mass|skeletal mass)\b"), "lb"),
     ("Visceral Fat Index", re.compile(r"\bvisceral fat(?: index)?\b"), None),
-    ("Body Water %", re.compile(r"\bbody water\s*%"), "%"),
+    ("Body Water %", re.compile(r"\bbody water\b"), "%"),
     ("Protein", re.compile(r"\bprotein\b"), "lb"),
     ("BMR", re.compile(r"\b(?:bmr|basal metabolic rate)\b"), "cal"),
     ("Metabolic Age", re.compile(r"\bmetabolic age\b"), "years"),
-    ("Resting Heart Rate", re.compile(r"\bresting heart rate\b"), "bpm"),
+    ("Resting Heart Rate", re.compile(r"\b(?:resting )?heart rate\b"), "bpm"),
     ("Weight", re.compile(r"\bweight\b"), "lb"),
     ("Body Cell Mass", re.compile(r"\bbody cell mass\b"), "lb"),
 ]
@@ -86,14 +86,45 @@ METRIC_SPECS: list[tuple[str, re.Pattern[str], str | None]] = [
 # accepted as-is — no known bound to check them against.
 METRIC_RANGES: dict[str, tuple[float, float]] = {
     "Weight": (80, 400),
+    "Body Fat Mass": (5, 150),
+    "Subcutaneous Fat Mass": (2, 100),
     "Body Fat %": (3, 60),
-    "Visceral Fat Index": (1, 30),
-    "Metabolic Age": (18, 100),
-    "BMR": (800, 3000),
+    "Lean Mass": (50, 250),
     "Skeletal Muscle Mass": (40, 150),
+    "Bone Mass": (5, 50),
+    "Visceral Fat Index": (1, 30),
+    "Body Water %": (30, 80),
+    "BMR": (800, 3000),
+    "Metabolic Age": (18, 100),
+    "Resting Heart Rate": (30, 220),
+    "Body Cell Mass": (30, 150),
 }
 
 NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+# Marks the "current" value on a card: Hume renders each card as
+# "previous LABEL > current" (or some ordering of that), and Vision reads the
+# trend arrow before the current value as a literal ">" or "›" character —
+# either merged onto the value's own token or as a separate token in the same
+# row. This is a more reliable signal for which value is current than
+# position, since a card's label can render before or after its previous
+# value depending on the report layout (see _resolve_previous_current()).
+CURRENT_MARKER_RE = re.compile(r"[>›]")
+
+# Minimum difflib.SequenceMatcher ratio for a fuzzy label match to be
+# accepted (see _fuzzy_bind_metrics()). Calibrated against real OCR garbling
+# ("Rodvca Macd" for "Body Cell Mass" scores 0.48) while staying clear of the
+# next-closest wrong metric for the same garbled text (0.40) — the fuzzy pass
+# also narrows the candidate pool to still-unbound metrics as it goes, which
+# is what keeps a threshold this low from misfiring in practice.
+FUZZY_LABEL_THRESHOLD = 0.45
+
+# Extra comparison strings for metrics whose canonical label alone is a poor
+# fuzzy target for how Hume actually renders (or OCR garbles) the card, e.g.
+# "BMR" is too short to compare well against a garbled multi-word label.
+FUZZY_ALIASES: dict[str, tuple[str, ...]] = {
+    "BMR": ("bmr (basal metabolic rate)", "basal metabolic rate"),
+}
 
 
 @dataclass
@@ -114,6 +145,8 @@ class Metric:
     current: str | None
     unit: str | None = None
     unverified: bool = False
+    source_label: str | None = None
+    """Raw OCR text the label was fuzzy-matched from; ``None`` for an exact match."""
 
 
 @dataclass
@@ -264,21 +297,191 @@ def _label_span(row: list[Token], pattern: re.Pattern[str]) -> tuple[int, int] |
     return start_idx, end_idx
 
 
-def _numbers_in_span(
+def _all_label_spans(
+    row: list[Token], all_patterns: list[re.Pattern[str]]
+) -> list[tuple[int, int]]:
+    """Every metric label's token span that matches somewhere in a row.
+
+    Used to find the boundaries between two metrics whose labels share a row
+    (Hume's horizontal summary strip renders "Weight ... Metabolic Age ..."
+    on one line), regardless of which metric is currently being bound.
+
+    Args:
+        row: A clustered OCR row, sorted left-to-right.
+        all_patterns: Every metric's compiled label pattern.
+
+    Returns:
+        Matched (start_index, end_index) spans, in no particular order.
+    """
+    spans = []
+    for pattern in all_patterns:
+        span = _label_span(row, pattern)
+        if span is not None:
+            spans.append(span)
+    return spans
+
+
+def _numeric_candidates_by_boundary(
     row: list[Token],
     row_idx: int,
-    min_x: float,
-    max_x: float,
+    own_span: tuple[int, int],
+    all_spans: list[tuple[int, int]],
     used: set[tuple[int, int]],
-) -> list[tuple[int, Token]]:
-    """Unclaimed numeric tokens in a row within [min_x, max_x], with index."""
-    return [
-        (i, t)
-        for i, t in enumerate(row)
-        if min_x <= t.x <= max_x
-        and (row_idx, i) not in used
-        and NUMBER_RE.search(t.text)
-    ]
+) -> list[tuple[int, int, Token]]:
+    """Unclaimed numeric tokens in a row whose nearest label is ``own_span``.
+
+    A row can carry more than one metric's label (the summary strip). Each
+    numeric token is assigned to whichever label span is closest to it by
+    token-index distance — ties (a token equidistant between two labels) go
+    to the preceding label, matching how Hume actually lays these rows out:
+    "LABEL_A value LABEL_B value" puts each value right after its own label,
+    not before the next one.
+
+    Args:
+        row: A clustered OCR row, sorted left-to-right.
+        row_idx: This row's index, for building (row_idx, token_idx) keys.
+        own_span: The token span of the label being bound.
+        all_spans: Every label span found on this row (including ``own_span``).
+        used: (row_index, token_index) pairs already claimed by another metric.
+
+    Returns:
+        ``(row_idx, token_idx, token)`` for each numeric token nearest to
+        ``own_span``.
+    """
+    results: list[tuple[int, int, Token]] = []
+    for i, token in enumerate(row):
+        if (row_idx, i) in used:
+            continue
+        if any(s[0] <= i <= s[1] for s in all_spans):
+            continue  # Part of a label, not a value.
+        if not NUMBER_RE.search(token.text):
+            continue
+        nearest = min(
+            all_spans,
+            key=lambda s: (
+                (s[0] - i) if s[0] > i else (i - s[1]),
+                0 if s[1] < i else 1,  # Tie-break: prefer the preceding label.
+            ),
+        )
+        if nearest == own_span:
+            results.append((row_idx, i, token))
+    return results
+
+
+def _row_has_bare_marker(row: list[Token]) -> bool:
+    """Whether a row carries a trend-arrow marker as its own standalone token."""
+    return any(
+        CURRENT_MARKER_RE.search(t.text) and not NUMBER_RE.search(t.text) for t in row
+    )
+
+
+def _resolve_previous_current(
+    candidates: list[tuple[int, int, Token]], rows: list[list[Token]]
+) -> tuple[str | None, str]:
+    """Decide which candidate values are "previous" and "current".
+
+    A candidate is "current" if its own token carries the trend-arrow marker
+    (">value" merged by OCR into one token), or if it is the sole numeric
+    candidate from a row that carries the marker as a separate token. This
+    keys the decision off the marker Hume actually renders rather than
+    position, since a card's previous value can render before or after its
+    label depending on layout. Position is only used as a fallback when no
+    candidate carries a marker (some cards render "previous LABEL current"
+    with no visible arrow at all) or when the marker is ambiguous — the
+    first candidate found is "previous", the last is "current".
+
+    Args:
+        candidates: Numeric candidates in scan order (own row first, then
+            forward-window rows), as returned by
+            :func:`_numeric_candidates_by_boundary` and its forward-window
+            counterpart.
+        rows: All clustered rows, for looking up a candidate's full row when
+            checking for a standalone marker token.
+
+    Returns:
+        ``(previous, current)`` numeric strings; ``previous`` is ``None``
+        when only one candidate was found.
+    """
+    if len(candidates) == 1:
+        return None, NUMBER_RE.search(candidates[0][2].text).group()
+
+    by_row: dict[int, list[int]] = {}
+    for idx, (row_idx, _, _) in enumerate(candidates):
+        by_row.setdefault(row_idx, []).append(idx)
+
+    marked = [bool(CURRENT_MARKER_RE.search(c[2].text)) for c in candidates]
+    for row_idx, idxs in by_row.items():
+        solo_unmarked = len(idxs) == 1 and not marked[idxs[0]]
+        if solo_unmarked and _row_has_bare_marker(rows[row_idx]):
+            marked[idxs[0]] = True
+
+    marked_candidates = [c for c, m in zip(candidates, marked, strict=True) if m]
+    unmarked_candidates = [c for c, m in zip(candidates, marked, strict=True) if not m]
+
+    if len(marked_candidates) == 1 and unmarked_candidates:
+        previous_tok, current_tok = unmarked_candidates[0][2], marked_candidates[0][2]
+    else:
+        previous_tok, current_tok = candidates[0][2], candidates[-1][2]
+    return (
+        NUMBER_RE.search(previous_tok.text).group(),
+        NUMBER_RE.search(current_tok.text).group(),
+    )
+
+
+def _gather_candidates(
+    rows: list[list[Token]],
+    label_idx: int,
+    own_span: tuple[int, int],
+    all_spans: list[tuple[int, int]],
+    used: set[tuple[int, int]],
+    pattern: re.Pattern[str],
+    all_patterns: list[re.Pattern[str]],
+) -> list[tuple[int, int, Token]]:
+    """Gather a label occurrence's numeric candidates from its card window.
+
+    Checks the label's own row first (boundary-aware, so a neighbouring
+    label sharing the row cannot donate its values), then up to
+    ``CARD_FORWARD_WINDOW`` rows below — mirroring the Hume card layout,
+    where values render either beside the label or directly beneath it.
+    Accumulation stops as soon as two candidates are found, or immediately
+    if a forward row's text matches another metric's label (the window has
+    run into the next card).
+
+    Args:
+        rows: Clustered OCR rows from :func:`cluster_rows`.
+        label_idx: Row index of the label occurrence.
+        own_span: The label's own token span on its row.
+        all_spans: Every label span found on the label's own row.
+        used: (row_index, token_index) pairs already claimed by another metric.
+        pattern: This metric's compiled label pattern.
+        all_patterns: Every metric's compiled label pattern.
+
+    Returns:
+        Numeric candidates in scan order, capped at two.
+    """
+    candidates: list[tuple[int, int, Token]] = []
+    for offset in range(CARD_FORWARD_WINDOW + 1):
+        row_idx = label_idx + offset
+        if row_idx >= len(rows):
+            continue
+        row = rows[row_idx]
+        if offset == 0:
+            found = _numeric_candidates_by_boundary(
+                row, row_idx, own_span, all_spans, used
+            )
+        else:
+            text = " ".join(t.text for t in row).lower()
+            if any(p is not pattern and p.search(text) for p in all_patterns):
+                break  # Ran into the next card; stop accumulating.
+            found = [
+                (row_idx, i, t)
+                for i, t in enumerate(row)
+                if (row_idx, i) not in used and NUMBER_RE.search(t.text)
+            ]
+        candidates.extend(found)
+        if len(candidates) >= 2:
+            break
+    return candidates[:2]
 
 
 def _bind_metric(
@@ -289,31 +492,15 @@ def _bind_metric(
 ) -> tuple[str | None, str] | None:
     """Locate a metric's label and bind its previous/current values.
 
-    Finds the first row whose text matches ``pattern`` at tokens not already
-    claimed by another metric, then gathers numeric values from that row and
-    up to ``CARD_FORWARD_WINDOW`` rows below it — mirroring the Hume card
-    layout, where values render either beside the label or directly beneath
-    it. The label's own row is checked first and on both sides of the label
-    (some cards render "previous  LABEL  current" on one line, others render
-    the label alone with values below), so a same-row card never falls
-    through to a row that belongs to the next card. Only unclaimed numeric
-    tokens within ``CARD_MAX_X_SPAN`` of the label's own tokens are
-    considered, keeping a neighbouring card sharing the row (the horizontal
-    summary strip) from being absorbed into this metric.
-
-    A single row does not always carry both values — OCR row-clustering can
-    split "previous" and "current" across two rows a fraction of a pixel
-    apart in y. So candidates accumulate across the window until two are
-    found, rather than stopping at the first row that has any; accumulation
-    stops early if a forward row's text matches another metric's label,
-    since that means the card window has run into the next card. If no
-    numeric value turns up anywhere in the window, the metric is abandoned —
-    the search does not continue past the window to some unrelated row later
-    in the document.
-
-    Tracking is per-token rather than per-row so two metrics whose labels sit
-    side by side on one shared row (e.g. "Weight ... Metabolic Age ...") each
-    claim only their own tokens instead of one consuming the whole row.
+    Scans every unclaimed occurrence of ``pattern`` top to bottom. A row
+    that carries more than one metric's label — Hume's horizontal summary
+    strip, e.g. "Weight ... Metabolic Age ..." — is a compressed highlight,
+    not the detailed card; it is kept as a fallback but a later occurrence
+    on a row with only this metric's label is preferred whenever one binds
+    successfully. A single-label occurrence that finds no value in its card
+    window aborts the whole search immediately: the metric is abandoned
+    rather than falling through to some unrelated row later in the document
+    that happens to contain the same text (e.g. a footnote).
 
     Args:
         rows: Clustered OCR rows from :func:`cluster_rows`.
@@ -321,63 +508,142 @@ def _bind_metric(
         used: (row_index, token_index) pairs already bound to another
             metric; mutated in place with the tokens this call claims.
         all_patterns: Every metric's compiled label pattern, used to detect
-            when a forward row has crossed into the next card.
+            a neighbouring label on the same row and a forward row that has
+            crossed into the next card.
 
     Returns:
         ``(previous, current)``, or ``None`` if the label was not found or no
         value bound to it.
     """
-    for label_idx, label_row in enumerate(rows):
-        row_text = " ".join(t.text for t in label_row).lower()
-        if not pattern.search(row_text):
-            continue
+    fallback: tuple[int, tuple[int, int], list[tuple[int, int, Token]]] | None = None
 
+    for label_idx, label_row in enumerate(rows):
         span = _label_span(label_row, pattern)
         if span is None:
-            return None
+            continue
         start_idx, end_idx = span
         if any((label_idx, i) in used for i in range(start_idx, end_idx + 1)):
             continue  # This occurrence's tokens are already another metric's.
 
-        min_x = label_row[start_idx].x - CARD_MAX_X_SPAN
-        max_x = label_row[end_idx].x + CARD_MAX_X_SPAN
-
-        candidates: list[tuple[int, int, Token]] = []
-        for offset in range(CARD_FORWARD_WINDOW + 1):
-            value_idx = label_idx + offset
-            if value_idx >= len(rows):
-                continue
-            row = rows[value_idx]
-            if offset > 0:
-                text = " ".join(t.text for t in row).lower()
-                if any(p is not pattern and p.search(text) for p in all_patterns):
-                    break  # Ran into the next card; stop accumulating.
-            found = _numbers_in_span(row, value_idx, min_x, max_x, used)
-            candidates.extend((value_idx, i, t) for i, t in found)
-            if len(candidates) >= 2:
-                break
-
-        if not candidates:
-            return None  # Label found but no numeric value in window: abandon it.
-
-        candidates.sort(key=lambda c: (c[0], c[2].x))
-        previous = (
-            NUMBER_RE.search(candidates[0][2].text).group()
-            if len(candidates) >= 2
-            else None
+        all_spans = _all_label_spans(label_row, all_patterns)
+        is_shared_row = len(all_spans) > 1
+        candidates = _gather_candidates(
+            rows, label_idx, span, all_spans, used, pattern, all_patterns
         )
-        current = NUMBER_RE.search(candidates[-1][2].text).group()
 
-        for i in range(start_idx, end_idx + 1):
-            used.add((label_idx, i))
-        used.add((candidates[0][0], candidates[0][1]))
-        used.add((candidates[-1][0], candidates[-1][1]))
-        return previous, current
+        if not is_shared_row:
+            if not candidates:
+                return None  # Label found but no value in window: abandon it.
+            return _finalize_binding(rows, label_idx, span, candidates, used)
+
+        if candidates and fallback is None:
+            fallback = (label_idx, span, candidates)
+
+    if fallback is not None:
+        return _finalize_binding(rows, *fallback, used)
     return None
+
+
+def _finalize_binding(
+    rows: list[list[Token]],
+    label_idx: int,
+    span: tuple[int, int],
+    candidates: list[tuple[int, int, Token]],
+    used: set[tuple[int, int]],
+) -> tuple[str | None, str]:
+    """Claim a binding's tokens and resolve its previous/current values."""
+    start_idx, end_idx = span
+    for i in range(start_idx, end_idx + 1):
+        used.add((label_idx, i))
+    for row_idx, token_idx, _ in candidates:
+        used.add((row_idx, token_idx))
+    return _resolve_previous_current(candidates, rows)
+
+
+def _fuzzy_bind_metrics(
+    rows: list[list[Token]],
+    used: set[tuple[int, int]],
+    already_bound: set[str],
+) -> list[Metric]:
+    """Bind still-unmatched metrics by fuzzy-comparing garbled labels.
+
+    Exact substring/regex matching cannot survive OCR garbling as severe as
+    "Boov -at Masd" for "Body Fat Mass". This pass compares every unclaimed
+    non-numeric token against each not-yet-bound metric's canonical label
+    (:data:`FUZZY_ALIASES` gives extra comparison strings where the label
+    text is too dissimilar to compare well, e.g. "BMR"), and accepts the
+    best match if it clears :data:`FUZZY_LABEL_THRESHOLD`. Candidate metrics
+    narrow to those still unbound as the scan proceeds, which is what keeps
+    a low threshold from misfiring — an already-bound metric's canonical
+    label can no longer steal a garbled token meant for another metric.
+
+    Only same-row values are considered (no forward-window search): a label
+    too garbled to match a known phrase is already a low-confidence bind,
+    and Hume's card layout renders the label's own value(s) on its own row
+    in every observed case.
+
+    Args:
+        rows: Clustered OCR rows from :func:`cluster_rows`.
+        used: (row_index, token_index) pairs already bound; mutated in place.
+        already_bound: Labels already bound by exact matching.
+
+    Returns:
+        Newly bound metrics, each carrying the raw OCR text it matched in
+        ``Metric.source_label`` so a bad match is visible in the output.
+    """
+    remaining = {
+        label: unit for label, _, unit in METRIC_SPECS if label not in already_bound
+    }
+    all_patterns = [pattern for _, pattern, _ in METRIC_SPECS]
+    matched: list[Metric] = []
+
+    for row_idx, row in enumerate(rows):
+        for tok_idx, token in enumerate(row):
+            if not remaining:
+                return matched
+            if (row_idx, tok_idx) in used or NUMBER_RE.search(token.text):
+                continue
+            if " " not in token.text.strip():
+                continue  # A lone word is too short to fuzzy-match reliably.
+            if any(p.search(token.text.lower()) for p in all_patterns):
+                continue  # A genuine (if unclaimed leftover) label, not garbled.
+
+            best_label, best_score = None, 0.0
+            for label in remaining:
+                aliases = FUZZY_ALIASES.get(label, (label.lower(),))
+                score = max(
+                    difflib.SequenceMatcher(None, token.text.lower(), alias).ratio()
+                    for alias in aliases
+                )
+                if score > best_score:
+                    best_label, best_score = label, score
+            if best_label is None or best_score < FUZZY_LABEL_THRESHOLD:
+                continue
+
+            own_span = (tok_idx, tok_idx)
+            candidates = _numeric_candidates_by_boundary(
+                row, row_idx, own_span, [own_span], used
+            )
+            if not candidates:
+                continue
+
+            used.add((row_idx, tok_idx))
+            for r_idx, t_idx, _ in candidates:
+                used.add((r_idx, t_idx))
+            previous, current = _resolve_previous_current(candidates, rows)
+            unit = remaining.pop(best_label)
+            matched.append(
+                Metric(best_label, previous, current, unit, source_label=token.text)
+            )
+    return matched
 
 
 def parse_metrics(rows: list[list[Token]]) -> list[Metric]:
     """Map known Hume labels to their previous/current values.
+
+    Runs exact word-boundary matching first (:func:`_bind_metric`), then a
+    fuzzy pass (:func:`_fuzzy_bind_metrics`) over whatever remains
+    unmatched, to recover labels OCR has garbled beyond exact matching.
 
     Args:
         rows: Clustered OCR rows from :func:`cluster_rows`.
@@ -386,16 +652,20 @@ def parse_metrics(rows: list[list[Token]]) -> list[Metric]:
         Parsed metrics in canonical order, skipping any not found or whose
         values could not be bound within the card window.
     """
-    metrics: list[Metric] = []
+    metrics: dict[str, Metric] = {}
     used: set[tuple[int, int]] = set()
     all_patterns = [pattern for _, pattern, _ in METRIC_SPECS]
     for label, pattern, unit in METRIC_SPECS:
-        bound = _bind_metric(rows, pattern, used, all_patterns)
-        if bound is None:
+        result = _bind_metric(rows, pattern, used, all_patterns)
+        if result is None:
             continue
-        previous, current = bound
-        metrics.append(Metric(label, previous, current, unit))
-    return metrics
+        previous, current = result
+        metrics[label] = Metric(label, previous, current, unit)
+
+    for metric in _fuzzy_bind_metrics(rows, used, set(metrics)):
+        metrics[metric.label] = metric
+
+    return [metrics[label] for label, _, _ in METRIC_SPECS if label in metrics]
 
 
 def _repair_unitless_value(raw: str, bounds: tuple[float, float]) -> str | None:
@@ -569,6 +839,18 @@ def render_markdown(report: Report, source: str, date: str, raw_only: bool) -> s
             "> Parsed from Apple Vision OCR by hume2md, binding each label to "
             "its own card. Rows flagged ⚠️ unverified failed a plausibility "
             "check — treat the source image as authoritative for those.",
+            "",
+        ]
+
+    fuzzy = [m for m in report.metrics if m.source_label]
+    if not raw_only and fuzzy:
+        lines += ["## Fuzzy-matched labels", ""]
+        lines += [f'- {m.label} ← "{m.source_label}"' for m in fuzzy]
+        lines += [
+            "",
+            "> These labels didn't match a known Hume phrasing exactly and were "
+            "bound by approximate text similarity — verify against the source "
+            "image before trusting the value.",
             "",
         ]
 
